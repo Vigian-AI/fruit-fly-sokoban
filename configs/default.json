@@ -1,0 +1,8 @@
+{
+  "episodes": 100,
+  "max_steps": 100,
+  "learning_rate": 0.01,
+  "gamma": 0.99,
+  "seed": 1,
+  "neurons": 64
+}

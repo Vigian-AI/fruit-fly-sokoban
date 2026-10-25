@@ -1,351 +1,183 @@
-// Command fly plays board games with a simulated MaleCNS v1.0 fruit-fly brain.
-//
-// Run the pipeline in order: download, build, then per game: features, train, eval, play.
-// Pick the game with -game (see `fly games`); the default is tic-tac-toe.
 package main
 
 import (
-	"errors"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
+	"time"
 
-	"github.com/empire/fruit-fly/internal/analyze"
-	"github.com/empire/fruit-fly/internal/connectome"
-	"github.com/empire/fruit-fly/internal/download"
-	"github.com/empire/fruit-fly/internal/features"
-	"github.com/empire/fruit-fly/internal/featureset"
-	"github.com/empire/fruit-fly/internal/game"
-	"github.com/empire/fruit-fly/internal/games"
-	"github.com/empire/fruit-fly/internal/play"
-	"github.com/empire/fruit-fly/internal/readout"
-	"github.com/empire/fruit-fly/internal/retina"
-	"github.com/empire/fruit-fly/internal/sim"
+	"sokoban-fruit-fly/internal/connectome"
+	"sokoban-fruit-fly/internal/download"
+	"sokoban-fruit-fly/internal/eval"
+	"sokoban-fruit-fly/internal/features"
+	"sokoban-fruit-fly/internal/games/sokoban"
+	"sokoban-fruit-fly/internal/readout"
+	"sokoban-fruit-fly/internal/train"
 )
-
-const (
-	dataDir      = "data"
-	rawDir       = "data/raw"
-	processedDir = "data/processed"
-)
-
-func featuresPath(t *game.Tree) string {
-	return filepath.Join(games.DataDir(dataDir, t), "features.bin")
-}
-
-func readoutPath(t *game.Tree, set string) string {
-	return filepath.Join(games.DataDir(dataDir, t), "readout_"+set+".bin")
-}
-
-func loadCache(t *game.Tree) (*features.Cache, error) {
-	c, err := features.Load(featuresPath(t), t)
-	return c, need(err, "features", t.Name)
-}
-
-func loadMatrix(set string, t *game.Tree) ([][]float64, error) {
-	x, err := featureset.Matrix(set, t, featuresPath(t))
-	return x, need(err, "features", t.Name)
-}
-
-// loadReadout builds a readout on a feature set and loads its trained weights.
-func loadReadout(t *game.Tree, set string) (*readout.Readout, error) {
-	x, err := loadMatrix(set, t)
-	if err != nil {
-		return nil, err
-	}
-	r := readout.New(t, x)
-	return r, need(r.Load(readoutPath(t, set)), "train", t.Name)
-}
-
-// loadBrain loads the connectome and fits the eyes to the game's board.
-func loadBrain(t *game.Tree) (*sim.Brain, *retina.Eyes, *connectome.Meta, error) {
-	g, meta, err := connectome.Load(processedDir)
-	if err != nil {
-		return nil, nil, nil, need(err, "build", "")
-	}
-	eyes, err := retina.New(g, t.Layout, retina.DefaultDrive)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	return sim.New(g, sim.DefaultParams()), eyes, meta, nil
-}
-
-type command struct {
-	help string
-	run  func(args []string) error
-}
-
-var commands = map[string]command{}
-var order []string
-
-func register(name, help string, run func(args []string) error) {
-	commands[name] = command{help, run}
-	order = append(order, name)
-}
-
-// gameFlags creates a flag set for a subcommand with the -game flag. Call tree after Parse.
-func gameFlags(name string) (fs *flag.FlagSet, tree func() (*game.Tree, error)) {
-	fs = flags(name)
-	spec := fs.String("game", "tictactoe", "game to play (see `fly games`)")
-	return fs, func() (*game.Tree, error) { return games.Lookup(*spec) }
-}
-
-func init() {
-	register("download", "fetch the MaleCNS v1.0 tables (~1.1 GB)", func([]string) error {
-		return download.All(rawDir)
-	})
-	register("build", "feathers -> signed sparse graph", func([]string) error {
-		_, _, err := connectome.Build(rawDir, processedDir)
-		return err
-	})
-	register("games", "list the games", func([]string) error {
-		for _, line := range games.Names() {
-			fmt.Println("  " + line)
-		}
-		return nil
-	})
-	register("bench", "time the simulation on this machine", func(args []string) error {
-		fs, tree := gameFlags("bench")
-		fs.Parse(args)
-		t, err := tree()
-		if err != nil {
-			return err
-		}
-		brain, eyes, _, err := loadBrain(t)
-		if err != nil {
-			return err
-		}
-		features.Bench(brain, eyes, t)
-		return nil
-	})
-	register("features", "simulate every position once and cache readout spikes", func(args []string) error {
-		fs, tree := gameFlags("features")
-		fs.Parse(args)
-		t, err := tree()
-		if err != nil {
-			return err
-		}
-		brain, eyes, _, err := loadBrain(t)
-		if err != nil {
-			return err
-		}
-		if t.Partial {
-			fmt.Printf("%s: %d sampled positions\n", t.Name, t.Decisions)
-		} else {
-			fmt.Printf("%s: %d positions\n", t.Name, t.Decisions)
-		}
-		c, err := features.Compute(brain, eyes, t, featuresPath(t))
-		if err != nil {
-			return err
-		}
-		features.Sanity(c)
-		fmt.Printf("next: %s\n", next("train", fs))
-		return nil
-	})
-	register("sanity", "does the brain's output depend on the board?", func(args []string) error {
-		fs, tree := gameFlags("sanity")
-		fs.Parse(args)
-		t, err := tree()
-		if err != nil {
-			return err
-		}
-		c, err := loadCache(t)
-		if err != nil {
-			return err
-		}
-		features.Sanity(c)
-		return nil
-	})
-	register("train", "train the linear readout with self-play REINFORCE", func(args []string) error {
-		fs, tree := gameFlags("train")
-		set := fs.String("features", "all", "brain, random, board or all")
-		gamesN := fs.Int("games", 300_000, "training games per readout")
-		seed := fs.Uint64("seed", 0, "random seed for training games")
-		fs.Parse(args)
-		t, err := tree()
-		if err != nil {
-			return err
-		}
-		names := featureset.Names
-		if *set != "all" {
-			names = []string{*set}
-		}
-		for _, name := range names {
-			x, err := loadMatrix(name, t)
-			if err != nil {
-				return err
-			}
-			cfg := readout.DefaultTrainConfig()
-			cfg.Games = *gamesN
-			cfg.Seed = *seed
-			if err := readout.Train(name, t, x, cfg).Save(readoutPath(t, name)); err != nil {
-				return err
-			}
-		}
-		fmt.Printf("next: %s\n", next("play", fs))
-		return nil
-	})
-	register("eval", "compare the fly with baselines", func(args []string) error {
-		fs, tree := gameFlags("eval")
-		gamesN := fs.Int("games", 4000, "games per column")
-		fs.Parse(args)
-		t, err := tree()
-		if err != nil {
-			return err
-		}
-		row := func(label string, s readout.Score) {
-			r, p := s.VsRandom, s.VsPerfect
-			if t.Partial {
-				fmt.Printf("%-34s %5.1f%% %5.1f%% %5.1f%%      n/a    n/a    n/a\n", label,
-					100*r.Win, 100*r.Draw, 100*r.Loss)
-				return
-			}
-			fmt.Printf("%-34s %5.1f%% %5.1f%% %5.1f%%   %5.1f%% %5.1f%% %5.1f%%\n", label,
-				100*r.Win, 100*r.Draw, 100*r.Loss, 100*p.Win, 100*p.Draw, 100*p.Loss)
-		}
-		fmt.Printf("%-34s %-22s   %s\n", t.Name, "   vs random player", "   vs perfect player")
-		fmt.Printf("%-34s %6s %6s %6s   %6s %6s %6s\n", "player", "win", "draw", "loss", "win", "draw", "loss")
-		row("random moves (baseline)", readout.Evaluate(t, readout.RandomChooser(), *gamesN, 0))
-		for _, name := range featureset.Names {
-			r, err := loadReadout(t, name)
-			if err != nil {
-				fmt.Printf("%-34s (not trained: %v)\n", featureset.Label(name, t), err)
-				continue
-			}
-			row(featureset.Label(name, t), readout.Evaluate(t, r.Chooser(), *gamesN, 0))
-		}
-		if t.Partial {
-			fmt.Printf("\n%d games per column, half moving first and half second. Sample of %d positions; vs perfect is n/a.\n", *gamesN, t.Decisions)
-		} else {
-			fmt.Printf("\n%d games per column, half moving first and half second. %s\n", *gamesN, perfectPlay(t))
-		}
-		return nil
-	})
-	register("analyze", "why does the brain readout play worse? three experiments", func(args []string) error {
-		fs, tree := gameFlags("analyze")
-		fs.Parse(args)
-		t, err := tree()
-		if err != nil {
-			return err
-		}
-		sets := map[string][][]float64{}
-		for _, name := range featureset.Names {
-			x, err := loadMatrix(name, t)
-			if err != nil {
-				return err
-			}
-			sets[name] = x
-		}
-		analyze.Run(t, sets)
-		return nil
-	})
-	register("play", "play against the fly in the terminal", func(args []string) error {
-		fs, tree := gameFlags("play")
-		second := fs.Bool("second", false, "let the fly move first")
-		sideFlag := fs.String("side", "", "tic-tac-toe style alias: x moves first, o second")
-		live := fs.Bool("live", false, "re-run the full simulation on every fly move")
-		fs.Parse(args)
-		t, err := tree()
-		if err != nil {
-			return err
-		}
-		r, err := loadReadout(t, "brain")
-		if err != nil {
-			return err
-		}
-		cache, err := loadCache(t)
-		if err != nil {
-			return err
-		}
-		brain, eyes, meta, err := loadBrain(t)
-		if err != nil {
-			return err
-		}
-		fly := &play.Fly{Readout: r, Cache: cache, Meta: meta}
-		if *live || t.Partial {
-			fly.Brain, fly.Eyes = brain, eyes
-		}
-		play.Game(fly, t, !*second && *sideFlag != "o", os.Stdin, os.Stdout)
-		return nil
-	})
-}
-
-// perfectPlay explains what "vs perfect" means for this game.
-func perfectPlay(t *game.Tree) string {
-	switch t.Value[t.Root] {
-	case 0:
-		return "The game is a draw under\nperfect play, so 'loss' against the perfect player is how often the player blunders."
-	case 1:
-		return "The first player wins under\nperfect play, so against the perfect player only the games moving first can be saved."
-	default:
-		return "The second player wins under\nperfect play, so against the perfect player only the games moving second can be saved."
-	}
-}
-
-func next(step string, fs *flag.FlagSet) string {
-	cmd := self() + " " + step
-	if g := fs.Lookup("game"); g != nil && g.Value.String() != "tictactoe" {
-		cmd += " -game " + g.Value.String()
-	}
-	return cmd
-}
-
-func need(err error, step, game string) error {
-	if err == nil || !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	cmd := self() + " " + step
-	if game != "" {
-		cmd += " -game " + game
-	}
-	return fmt.Errorf("%w (run `%s` first)", err, cmd)
-}
-
-func self() string {
-	if goRun(os.Args[0]) {
-		return "go run ./cmd/fly"
-	}
-	if exe, err := os.Executable(); err == nil && goRun(exe) {
-		return "go run ./cmd/fly"
-	}
-	return os.Args[0]
-}
-
-func goRun(p string) bool {
-	p = filepath.ToSlash(p)
-	if strings.Contains(p, "/go-build") {
-		return true
-	}
-	cache := filepath.ToSlash(os.Getenv("GOCACHE"))
-	return cache != "" && cache != "off" && strings.HasPrefix(p, strings.TrimSuffix(cache, "/")+"/")
-}
-
-func usage() {
-	fmt.Fprintln(os.Stderr, "usage: fly <command> [flags]\n\ncommands:")
-	for _, name := range order {
-		fmt.Fprintf(os.Stderr, "  %-9s %s\n", name, commands[name].help)
-	}
-}
 
 func main() {
 	if len(os.Args) < 2 {
 		usage()
-		os.Exit(2)
+		return
 	}
-	cmd, ok := commands[os.Args[1]]
-	if !ok {
+	switch os.Args[1] {
+	case "games":
+		fmt.Println("sokoban: level01, level02")
+	case "download":
+		downloadCommand(os.Args[2:])
+	case "train":
+		trainCommand(os.Args[2:])
+	case "eval":
+		evalCommand(os.Args[2:])
+	case "features":
+		featuresCommand(os.Args[2:])
+	case "play":
+		playCommand(os.Args[2:])
+	default:
 		usage()
-		os.Exit(2)
-	}
-	if err := cmd.run(os.Args[2:]); err != nil {
-		fmt.Fprintln(os.Stderr, "fly:", err)
-		os.Exit(1)
 	}
 }
-
-// flags creates a flag set for a subcommand that exits on -h.
-func flags(name string) *flag.FlagSet {
-	return flag.NewFlagSet("fly "+name, flag.ExitOnError)
+func usage() { fmt.Println("fly {games|download|features|train|eval|play} [options]") }
+func downloadCommand(args []string) {
+	fs := flag.NewFlagSet("download", flag.ExitOnError)
+	dir := fs.String("raw-dir", "data/raw", "directory for the MaleCNS feather tables")
+	fs.Parse(args)
+	if err := download.All(*dir); err != nil {
+		fatal(fmt.Errorf("download connectome dataset: %w", err))
+	}
+	fmt.Printf("connectome tables are ready in %s\n", *dir)
 }
+func common(fs *flag.FlagSet) (*string, *int, *int64, *int, *string, *string, *string, *string) {
+	level := fs.String("level", "level01", "level name")
+	neurons := fs.Int("neurons", 64, "number of simulated neurons")
+	seed := fs.Int64("seed", 1, "random seed")
+	max := fs.Int("max-steps", 100, "episode step limit")
+	out := fs.String("output-dir", "results", "output directory")
+	config := fs.String("config", "configs/default.json", "configuration file (reserved for experiment metadata)")
+	mode := fs.String("network-mode", "lightweight", "network mode: lightweight or connectome")
+	graphDir := fs.String("graph-dir", "data/connectome", "directory containing graph.bin and meta.json")
+	return level, neurons, seed, max, out, config, mode, graphDir
+}
+func extractor(b sokoban.Board, seed int64, neurons int, mode, graphDir string) (*features.Extractor, error) {
+	if mode == "lightweight" {
+		return features.New(b, seed, neurons), nil
+	}
+	if mode != "connectome" {
+		return nil, fmt.Errorf("unknown network mode %q", mode)
+	}
+	g, _, err := connectome.Load(graphDir)
+	if err != nil {
+		return nil, err
+	}
+	return features.NewConnectome(b, g, 48)
+}
+func board(name string) (sokoban.Board, error) { return sokoban.Load(name) }
+func trainCommand(args []string) {
+	fs := flag.NewFlagSet("train", flag.ExitOnError)
+	level, n, seed, max, out, _, mode, graphDir := common(fs)
+	episodes := fs.Int("episodes", 100, "training episodes")
+	lr := fs.Float64("learning-rate", 0.01, "policy learning rate")
+	gamma := fs.Float64("gamma", 0.99, "discount factor")
+	fs.Parse(args)
+	b, e := board(*level)
+	if e != nil {
+		fatal(e)
+	}
+	f, e := extractor(b, *seed, *n, *mode, *graphDir)
+	if e != nil {
+		fatal(e)
+	}
+	p := readout.New(f.Dimension())
+	cfg := train.Config{Episodes: *episodes, MaxSteps: *max, LearningRate: *lr, Gamma: *gamma, Seed: *seed, Neurons: *n}
+	metrics, e := (&train.Trainer{Board: b, Extractor: f.Extract, Policy: p, Config: cfg}).Run(*out)
+	if e != nil {
+		fatal(e)
+	}
+	if e = p.Save(filepath.Join(*out, "checkpoint.json")); e != nil {
+		fatal(e)
+	}
+	fmt.Printf("trained %d episodes; checkpoint=%s\n", len(metrics), filepath.Join(*out, "checkpoint.json"))
+}
+func evalCommand(args []string) {
+	fs := flag.NewFlagSet("eval", flag.ExitOnError)
+	level, n, seed, max, out, _, mode, graphDir := common(fs)
+	fs.Parse(args)
+	b, e := board(*level)
+	if e != nil {
+		fatal(e)
+	}
+	f, e := extractor(b, *seed, *n, *mode, *graphDir)
+	if e != nil {
+		fatal(e)
+	}
+	p, e := readout.Load(filepath.Join(*out, "checkpoint.json"))
+	if e != nil {
+		fatal(e)
+	}
+	r, e := eval.Run(b, p, f, *max)
+	if e != nil {
+		fatal(e)
+	}
+	v, _ := json.MarshalIndent(r, "", "  ")
+	fmt.Println(string(v))
+}
+func featuresCommand(args []string) {
+	fs := flag.NewFlagSet("features", flag.ExitOnError)
+	level, n, seed, _, _, _, mode, graphDir := common(fs)
+	fs.Parse(args)
+	b, e := board(*level)
+	if e != nil {
+		fatal(e)
+	}
+	f, e := extractor(b, *seed, *n, *mode, *graphDir)
+	if e != nil {
+		fatal(e)
+	}
+	x, e := f.Extract(b.Start())
+	if e != nil {
+		fatal(e)
+	}
+	fmt.Printf("level=%s feature-dimension=%d activity=%v\n", *level, len(x), x)
+}
+func playCommand(args []string) {
+	fs := flag.NewFlagSet("play", flag.ExitOnError)
+	level, n, seed, max, out, _, mode, graphDir := common(fs)
+	fs.Parse(args)
+	b, e := board(*level)
+	if e != nil {
+		fatal(e)
+	}
+	f, e := extractor(b, *seed, *n, *mode, *graphDir)
+	if e != nil {
+		fatal(e)
+	}
+	p, e := readout.Load(filepath.Join(*out, "checkpoint.json"))
+	if e != nil {
+		fatal(e)
+	}
+	s := b.Start()
+	for i := 0; i < *max && !b.Won(s); i++ {
+		fmt.Printf("\n%s\n", b.Render(s))
+		x, _ := f.Extract(s)
+		legal := train.Legal(b, s)
+		if len(legal) == 0 {
+			break
+		}
+		probs, _ := p.Probs(x, legal)
+		a := legal[0]
+		for _, candidate := range legal {
+			if probs[candidate] > probs[a] {
+				a = candidate
+			}
+		}
+		s, _, e = b.Step(s, a)
+		if e != nil {
+			fatal(e)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	fmt.Printf("\n%s\nwon=%v\n", b.Render(s), b.Won(s))
+}
+func fatal(e error) { fmt.Fprintln(os.Stderr, e); os.Exit(1) }
